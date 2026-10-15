@@ -365,6 +365,46 @@ static void CheckGuards(const std::string& only) {
     Require(checked);
 }
 
+static std::vector<std::uint32_t> ConstantTableCaller() {
+    return {0xbeea03ffu, 0xe0040000u, 0xbeeb03ffu, 0x0000000fu, 0xf4080135u, 0xfa000000u, 0xbf8cc07fu, 0xf4240382u, 0xfa000020u, 0xbf8cc07fu,
+        0xbf130e80u, 0xbf840004u, 0xf4240402u, 0xfa000028u, 0xbf8cc07fu, 0xbe8e210eu, 0xbf810000u};
+}
+
+static void CheckConstantTableCalls() {
+    const SwappcInfo swappc{false, 0u, 16u, 64u};
+    const auto caller = ConstantTableCaller();
+    const auto program = RdnaInstructionDecoder{}.Decode(caller);
+    const auto calls = FindTableCalls(program, swappc);
+    Require(calls.size() == 1u);
+    Require(calls[0].programCounter == 0x3cu && calls[0].linkRegister == 14u && calls[0].targetRegister == 14u && calls[0].constantPointer == 0xfe0040000ull);
+    Require(calls[0].descriptorOffset == 0u && calls[0].entryOffset == 0x20u && calls[0].entryStride == 0u);
+    Require(FindUserDataCalls(program, swappc).empty());
+    const auto table = [&](std::initializer_list<std::pair<std::size_t, std::uint32_t>> patches) {
+        auto code = caller;
+        for (const auto& [word, value] : patches) code[word] = value;
+        return FindTableCalls(RdnaInstructionDecoder{}.Decode(code), swappc);
+    };
+    const auto inlineHigh = table({{2u, 0xbeeb038fu}, {3u, 0xbf800000u}});
+    Require(inlineHigh.size() == 1u && inlineHigh[0].constantPointer == 0xfe0040000ull);
+    Require(table({{2u, 0xbeeb0305u}, {3u, 0xbf800000u}}).empty());
+    Require(table({{11u, 0xbf820000u}}).empty());
+    Require(table({{11u, 0xbf840000u}}).empty());
+    Require(table({{2u, 0xbeeb038fu}, {3u, 0x7d840080u}}).empty());
+    ExpectThrow("not statically resolvable", [&] { static_cast<void>(BuildCode(caller, swappc)); });
+
+    const std::vector<std::uint32_t> first{0xbf068000u, 0x4a020285u, 0xbe80200eu};
+    const std::vector<std::uint32_t> second{0x4a0202c0u, 0xbf068001u, 0xbe80200eu};
+    const std::vector<std::vector<TableCallee>> callees{{{0x1122334455ull, first}, {0x66778899aaull, second}}};
+    const auto linkedCalls = LinkCalls(program, {}, {}, calls, callees);
+    const auto& linked = linkedCalls.code;
+    Require(linkedCalls.fallbacks.size() == 1u && std::equal(caller.begin(), caller.begin() + 15, linked.begin()) && linked[15] == 0xbf820001u);
+    SwappcInfo linkedSwappc = swappc;
+    linkedSwappc.linkedCallFallbacks = linkedCalls.fallbacks;
+    const auto cfg = BuildCode(linked, linkedSwappc);
+    Require(cfg.unlinkedCallProgramCounters == linkedCalls.fallbacks);
+    static_cast<void>(TranslateCode(linked, linkedSwappc));
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 1) {
@@ -374,6 +414,7 @@ int main(int argc, char** argv) {
             CheckRejections();
             CheckUserDataCalls();
             CheckTableCalls();
+            CheckConstantTableCalls();
             CheckGuards("");
         } else {
             Require(argc == 2);

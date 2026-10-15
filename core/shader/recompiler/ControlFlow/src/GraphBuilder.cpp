@@ -1286,10 +1286,34 @@ bool isScalarBufferLoad(RdnaOpcode op) {
     }
 }
 
+bool findLastWriterPastConditionals(const RdnaProgram& program, std::uint32_t end, std::initializer_list<std::uint32_t> indices, std::uint32_t& writer, std::uint32_t waveSize) {
+    for (auto position = end; position-- > 0u;) {
+        const auto& instruction = program.instructions[position];
+        if ((IsDirectBranchOpcode(instruction.op) && !IsConditionalBranchOpcode(instruction.op)) || instruction.op == RdnaOpcode::SSetpcB64 || instruction.op == RdnaOpcode::SEndpgm) return false;
+        if (std::ranges::any_of(indices, [&](std::uint32_t index) { return writesScalar(instruction, index, waveSize); })) {
+            writer = position;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool constantPair(const RdnaProgram& program, std::uint32_t reg, std::uint32_t before, std::uint32_t waveSize, std::uint32_t& first, std::uint64_t& value) {
+    std::uint32_t low = 0, high = 0, lowWrite = 0, highWrite = 0;
+    if (!findLastWriterPastConditionals(program, before, {reg}, lowWrite, waveSize) || !findLastWriterPastConditionals(program, before, {reg + 1u}, highWrite, waveSize)) return false;
+    const auto& lowWriter = program.instructions[lowWrite];
+    const auto& highWriter = program.instructions[highWrite];
+    if (lowWriter.op != RdnaOpcode::SMovB32 || !isScalar(lowWriter.destination, reg) || !isImmediate(lowWriter.source0, low) ||
+        highWriter.op != RdnaOpcode::SMovB32 || !isScalar(highWriter.destination, reg + 1u) || !isImmediate(highWriter.source0, high)) return false;
+    first = std::min(lowWrite, highWrite);
+    value = (static_cast<std::uint64_t>(high) << 32u) | low;
+    return true;
+}
+
 bool loadedDword(const RdnaProgram& program, std::uint32_t reg, std::uint32_t before, std::uint32_t waveSize, std::uint32_t& load, std::uint32_t& dword) {
     for (std::uint32_t copies = 0; copies < 4u; ++copies) {
         std::uint32_t writer = 0;
-        if (!findLastWriter(program, before, {reg}, writer, waveSize)) return false;
+        if (!findLastWriterPastConditionals(program, before, {reg}, writer, waveSize)) return false;
         const auto& instruction = program.instructions[writer];
         const auto destination = scalarIndex(instruction.destination);
         const auto source = scalarIndex(instruction.source0);
@@ -1451,22 +1475,30 @@ std::vector<TableCall> FindTableCalls(const RdnaProgram& program, const SwappcIn
         const auto descriptor = scalarIndex(load.source0);
         if (load.source0.kind != RdnaOperandKind::ScalarRegister || descriptor % 4u != 0u || load.memoryOffset >= 0x100000u || (load.memoryOffset & 3u) != 0u) continue;
         std::uint32_t descriptorLoad = 0;
-        if (!findLastWriter(program, lowLoad, {descriptor, descriptor + 1u, descriptor + 2u, descriptor + 3u}, descriptorLoad, swappc.waveSize) || !sameBlock(descriptorLoad, index)) continue;
+        if (!findLastWriterPastConditionals(program, lowLoad, {descriptor, descriptor + 1u, descriptor + 2u, descriptor + 3u}, descriptorLoad, swappc.waveSize) || !sameBlock(descriptorLoad, index)) continue;
         const auto& table = program.instructions[descriptorLoad];
         const auto pointer = scalarIndex(table.source0);
-        if (table.op != RdnaOpcode::SLoadDwordx4 || !isScalar(table.destination, descriptor) || table.source0.kind != RdnaOperandKind::ScalarRegister || table.source1.kind != RdnaOperandKind::Null ||
-            table.memoryOffset >= 0x100000u || (table.memoryOffset & 3u) != 0u || !userData(pointer) || !userData(pointer + 1u) ||
-            !unchangedUntil(program, pointer, descriptorLoad, swappc.waveSize) || !unchangedUntil(program, pointer + 1u, descriptorLoad, swappc.waveSize)) continue;
+        if (table.op != RdnaOpcode::SLoadDwordx4 || !isScalar(table.destination, descriptor) || pointer == NoScalarRegister || pointer % 2u != 0u || table.source1.kind != RdnaOperandKind::Null ||
+            table.memoryOffset >= 0x100000u || (table.memoryOffset & 3u) != 0u) continue;
+        std::optional<std::uint64_t> constantPointer;
+        if (userData(pointer) && userData(pointer + 1u)) {
+            if (!unchangedUntil(program, pointer, descriptorLoad, swappc.waveSize) || !unchangedUntil(program, pointer + 1u, descriptorLoad, swappc.waveSize)) continue;
+        } else {
+            std::uint32_t first = 0;
+            std::uint64_t value = 0;
+            if (!constantPair(program, pointer, descriptorLoad, swappc.waveSize, first, value) || !sameBlock(first, index)) continue;
+            constantPointer = value;
+        }
         std::uint32_t stride = 0;
         if (load.source1.kind != RdnaOperandKind::Null) {
             const auto offset = scalarIndex(load.source1);
             std::uint32_t shift = 0, shiftIndex = 0;
-            if (offset == NoScalarRegister || !findLastWriter(program, lowLoad, {offset}, shiftIndex, swappc.waveSize) || !sameBlock(shiftIndex, index)) continue;
+            if (offset == NoScalarRegister || !findLastWriterPastConditionals(program, lowLoad, {offset}, shiftIndex, swappc.waveSize) || !sameBlock(shiftIndex, index)) continue;
             const auto& shifted = program.instructions[shiftIndex];
             if (shifted.op != RdnaOpcode::SLshlB32 || !isScalar(shifted.destination, offset) || !isImmediate(shifted.source1, shift) || shift < 2u || shift > 24u) continue;
             stride = 1u << shift;
         }
-        calls.push_back({instruction.programCounter, link, target, pointer, table.memoryOffset, load.memoryOffset + lowDword * 4u, stride});
+        calls.push_back({instruction.programCounter, link, target, pointer, table.memoryOffset, load.memoryOffset + lowDword * 4u, stride, constantPointer});
     }
     return calls;
 }
