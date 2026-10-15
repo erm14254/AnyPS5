@@ -26,6 +26,7 @@
 #include <vector>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <map>
 #include <limits>
 #include <exception>
@@ -1910,8 +1911,12 @@ bool StorageTexture::Refresh() {
     // with their results, which are stored first, as the layer model does; new keys that are a
     // clear code make every result dead on hardware too. Without a generation (no tracking) a
     // unit's stamps say nothing, so it is stored.
+    // Debug aid: APS5_KEEP_GPU_BLOCKS=1 stores pending results over changed guest bytes instead of
+    // dropping them; a clear code still drops them.
+    static const bool keepGpuBlocks = std::getenv("APS5_KEEP_GPU_BLOCKS") != nullptr;
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
+        if (keepGpuBlocks) return false;
         if (compared) return stampedBlocks.at(unit) == GuestMemory::BlockWritten;
         if (!tracked || layerGeneration[unit] == 0 || unit >= stampedBlocks.size() || stampedBlocks[unit] != GuestMemory::BlockWritten) return false;
         const auto begin = layerBegin(unit);
@@ -3455,7 +3460,7 @@ const StorageDumpSelector& StorageDumpSelection() {
 bool StorageDumpSelects(const GuestTextureResource& descriptor) {
     const auto& selector = StorageDumpSelection();
     if (selector.address != 0) return descriptor.baseAddress == selector.address;
-    return selector.width != 0 && descriptor.width == selector.width && descriptor.height == selector.height && descriptor.depthOrLastArray + 1 == selector.layers && (selector.anyFormat || descriptor.format == selector.format);
+    return selector.width != 0 && descriptor.width == selector.width && descriptor.height == selector.height && (selector.layers == 0 || descriptor.depthOrLastArray + 1 == selector.layers) && (selector.anyFormat || descriptor.format == selector.format);
 }
 
 }
@@ -4522,6 +4527,10 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    if (StorageDumpSelection().width != 0 || StorageDumpSelection().address != 0) {
+        static std::atomic<int> entries{0};
+        if (entries.fetch_add(1) < 40) std::fprintf(stderr, "[storage-dump] writeBackLayers 0x%llx %ux%u format=%u reason=%s layers=%zu selected=%d" "%c", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.format, flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)), StorageDumpSelects(descriptor) ? 1 : 0, 10);
+    }
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -4568,6 +4577,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     std::vector<std::uint8_t> changedBlocks(spanBlocks);
     const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
+    // Debug aid: APS5_STORE_ALL_BLOCKS=1 stores every block of the selected layers, also the ones
+    // the tracker says the CPU wrote.
+    static const bool storeAllBlocks = std::getenv("APS5_STORE_ALL_BLOCKS") != nullptr;
+    if (storeAllBlocks) std::fill(changedBlocks.begin(), changedBlocks.end(), 0);
     std::vector<bool> compared(trackedLayers, false);
     if (!tracked) {
         awaitStoredSave(&layers);
@@ -4888,9 +4901,17 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
     }
     const bool dumpSelected = StorageDumpSelects(descriptor);
+    if (StorageDumpSelection().width != 0 || StorageDumpSelection().address != 0) {
+        static std::mutex seenMutex;
+        static std::set<std::uint64_t> seen;
+        std::lock_guard seenLock(seenMutex);
+        if (seen.insert(descriptor.baseAddress ^ (static_cast<std::uint64_t>(descriptor.format) << 48u)).second) std::fprintf(stderr, "[storage-dump] write-back of 0x%llx %ux%u lastArray=%u format=%u vk=%d: %s\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.depthOrLastArray, descriptor.format, static_cast<int>(storageFormat), dumpSelected ? "selected" : "not selected");
+    }
     static int dumps = 0;
+    // Debug aid: APS5_DUMP_STORAGE_MAX=<n> raises the dump count from the default 8.
+    static const int dumpLimit = [] { const char* text = std::getenv("APS5_DUMP_STORAGE_MAX"); return text != nullptr ? std::atoi(text) : 8; }();
     std::unique_ptr<Buffer> dump;
-    if (dumpSelected && dumps < 8) {
+    if (dumpSelected && dumps < dumpLimit) {
         dump = std::make_unique<Buffer>(context, static_cast<std::size_t>(mips[0].linearSize * arrayLayers), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
