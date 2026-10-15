@@ -146,7 +146,58 @@ public:
         }
     }
 
+    bool ClaimSystem(const void* pointer, std::size_t bytes) {
+        constexpr std::uintptr_t page = 0x4000;
+        std::lock_guard lock(_lock);
+        const auto start = reinterpret_cast<std::uintptr_t>(pointer);
+        if (_base == 0 || bytes == 0 || start % page != 0 || bytes % page != 0 || start < SystemReservedStart || bytes > SystemReservedEnd - start) return false;
+        const auto end = start + bytes;
+#if defined(__linux__)
+        void* const wanted = reinterpret_cast<void*>(start);
+        void* const placed = mmap(wanted, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (placed != wanted) {
+            if (placed != MAP_FAILED) munmap(placed, bytes);
+            return false;
+        }
+#else
+        if (OverlapsHostRegion(start, bytes)) return false;
+#endif
+        Carve(_used, start, end);
+        Carve(_holes, start, end);
+        Carve(_hostRegions, start, end);
+        return true;
+    }
+
 private:
+    static void Carve(std::map<std::uintptr_t, std::uintptr_t>& ranges, std::uintptr_t start, std::uintptr_t end) {
+        auto it = ranges.upper_bound(start);
+        if (it != ranges.begin()) --it;
+        while (it != ranges.end() && it->first < end) {
+            const auto rangeStart = it->first;
+            const auto rangeEnd = it->second;
+            if (rangeEnd <= start) {
+                ++it;
+                continue;
+            }
+            it = ranges.erase(it);
+            if (rangeStart < start) ranges.emplace(rangeStart, start);
+            if (rangeEnd > end) ranges.emplace(end, rangeEnd);
+        }
+    }
+
+    static void Carve(std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& ranges, std::uintptr_t start, std::uintptr_t end) {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> kept;
+        for (const auto& [rangeStart, rangeEnd] : ranges) {
+            if (rangeEnd <= start || rangeStart >= end) {
+                kept.emplace_back(rangeStart, rangeEnd);
+                continue;
+            }
+            if (rangeStart < start) kept.emplace_back(rangeStart, start);
+            if (rangeEnd > end) kept.emplace_back(end, rangeEnd);
+        }
+        ranges = std::move(kept);
+    }
+
     Arena() {
 #if defined(__linux__)
         SeedLinuxUsedRanges();
@@ -315,6 +366,10 @@ std::uintptr_t GuestArenaHighestFree_nid_no_patch(std::size_t bytes, std::size_t
 
 void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
     Arena::Get().MarkUsed(pointer, bytes);
+}
+
+bool GuestArenaClaimSystem_nid_postfix(const void* pointer, std::size_t bytes) {
+    return Arena::Get().ClaimSystem(pointer, bytes);
 }
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {

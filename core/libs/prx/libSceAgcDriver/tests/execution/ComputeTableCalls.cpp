@@ -17,6 +17,8 @@
 #include <unistd.h>
 #endif
 
+extern "C" std::uint64_t SystemGpuPage_nid_no_patch();
+
 namespace {
 
 using AgcDriver::Graphics::Require;
@@ -29,11 +31,18 @@ alignas(256) constexpr std::array<std::uint32_t, 64> Caller{
     0xbe8e0308u, 0xbe8f0309u, 0xbf068103u, 0xbe8e210eu, 0x34040082u, 0xe0701000u, 0x80010102u, 0xbf810000u,
     0xbf9f0000u, 0x30306c73u, 0x00000040u, 0x00000008u};
 alignas(256) std::array<std::uint32_t, 64> ConstantCaller{};
+alignas(256) std::array<std::uint32_t, 64> SystemCaller{};
 alignas(256) constexpr std::array<std::uint32_t, 3> SelectSixteen{0x85159091u, 0x7e020215u, 0xbe80200eu};
 alignas(256) constexpr std::array<std::uint32_t, 3> SelectThirtyTwo{0x8515a0a1u, 0x7e020215u, 0xbe80200eu};
 alignas(16) std::array<std::uint32_t, 8> Table{};
 alignas(16) std::array<std::uint32_t, 4> Descriptors{};
 alignas(256) std::array<std::uint32_t, Threads> Output{};
+
+std::array<std::uint32_t, 64> ConstantDescriptorCaller(std::uintptr_t descriptors) {
+    return {0x7e020280u, 0xbeea03ffu, static_cast<std::uint32_t>(descriptors), 0xbeeb03ffu, static_cast<std::uint32_t>(descriptors >> 32u), 0xf4080435u, 0xfa000000u, 0x8f148402u,
+        0xbf8cc07fu, 0xf4240208u, 0x28000000u, 0xbf8cc07fu, 0xbe8e0308u, 0xbe8f0309u, 0xbf130e80u, 0xbf840002u,
+        0xbf068103u, 0xbe8e210eu, 0x34040082u, 0xe0701000u, 0x80010102u, 0xbf810000u, 0xbf9f0000u, 0x30306c73u, 0x00000040u, 0x00000008u};
+}
 
 void Fill() {
     const auto first = reinterpret_cast<std::uintptr_t>(SelectSixteen.data());
@@ -41,10 +50,10 @@ void Fill() {
     Table = {static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32u), 0u, 0u, static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u), 0u, 0u};
     const auto table = reinterpret_cast<std::uintptr_t>(Table.data());
     Descriptors = {static_cast<std::uint32_t>(table), static_cast<std::uint32_t>((table >> 32u) & 0xffffu) | (16u << 16u), 2u, 0x31016facu};
-    const auto descriptors = reinterpret_cast<std::uintptr_t>(Descriptors.data());
-    ConstantCaller = {0x7e020280u, 0xbeea03ffu, static_cast<std::uint32_t>(descriptors), 0xbeeb03ffu, static_cast<std::uint32_t>(descriptors >> 32u), 0xf4080435u, 0xfa000000u, 0x8f148402u,
-        0xbf8cc07fu, 0xf4240208u, 0x28000000u, 0xbf8cc07fu, 0xbe8e0308u, 0xbe8f0309u, 0xbf130e80u, 0xbf840002u,
-        0xbf068103u, 0xbe8e210eu, 0x34040082u, 0xe0701000u, 0x80010102u, 0xbf810000u, 0xbf9f0000u, 0x30306c73u, 0x00000040u, 0x00000008u};
+    ConstantCaller = ConstantDescriptorCaller(reinterpret_cast<std::uintptr_t>(Descriptors.data()));
+    const auto system = SystemGpuPage_nid_no_patch();
+    Require(system == 0xfe0040000ull, "the system GPU page is unavailable");
+    SystemCaller = ConstantDescriptorCaller(system);
 }
 
 std::array<std::uint32_t, 8> UserData(std::uint32_t index, bool scc) {
@@ -54,7 +63,7 @@ std::array<std::uint32_t, 8> UserData(std::uint32_t index, bool scc) {
         static_cast<std::uint32_t>(output), static_cast<std::uint32_t>((output >> 32u) & 0xffffu), static_cast<std::uint32_t>(sizeof(Output)), 0x31016facu};
 }
 
-std::vector<std::uint32_t> Commands(const std::array<std::uint32_t, 8>& data, bool wave32, bool constant) {
+std::vector<std::uint32_t> Commands(const std::array<std::uint32_t, 8>& data, bool wave32, const std::uint32_t* code) {
     std::vector<std::uint32_t> words;
     const auto registers = [&](std::uint32_t first, std::span<const std::uint32_t> values) {
         words.push_back(0xc0007600u | (static_cast<std::uint32_t>(values.size()) << 16u));
@@ -63,7 +72,7 @@ std::vector<std::uint32_t> Commands(const std::array<std::uint32_t, 8>& data, bo
     };
     const std::array<std::uint32_t, 3> shape{Threads, 1, 1};
     registers(0x207, shape);
-    const auto address = reinterpret_cast<std::uintptr_t>(constant ? ConstantCaller.data() : Caller.data());
+    const auto address = reinterpret_cast<std::uintptr_t>(code);
     const std::array<std::uint32_t, 2> program{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>(address >> 40u)};
     registers(0x20c, program);
     const std::array<std::uint32_t, 1> resource{static_cast<std::uint32_t>(data.size()) << 1u};
@@ -110,9 +119,9 @@ private:
     int saved = -1;
 };
 
-std::string Dispatch(std::uint32_t index, bool scc, bool wave32, bool constant) {
+std::string Dispatch(std::uint32_t index, bool scc, bool wave32, const std::uint32_t* code) {
     Output.fill(Untouched);
-    const auto words = Commands(UserData(index, scc), wave32, constant);
+    const auto words = Commands(UserData(index, scc), wave32, code);
     Packet packet{const_cast<std::uint32_t*>(words.data()), static_cast<std::uint32_t>(words.size()), 0, {}};
     StderrCapture log;
     std::string failure;
@@ -126,8 +135,8 @@ std::string Dispatch(std::uint32_t index, bool scc, bool wave32, bool constant) 
     return log.Finish() + failure;
 }
 
-void Check(std::uint32_t index, bool scc, bool wave32, bool constant, std::uint32_t expected, const std::string& what) {
-    const auto log = Dispatch(index, scc, wave32, constant);
+void Check(std::uint32_t index, bool scc, bool wave32, const std::uint32_t* code, std::uint32_t expected, const std::string& what) {
+    const auto log = Dispatch(index, scc, wave32, code);
     Require(log.find("no linked callee") == std::string::npos && log.find("unlinked") == std::string::npos, what + ": a linked callee was reported missing: " + log);
     for (std::uint32_t lane = 0; lane < Threads; ++lane) {
         Require(Output[lane] == expected, what + (wave32 ? " (wave32)" : " (wave64)") + ": lane " + std::to_string(lane) + " is " + std::to_string(Output[lane]) + ", expected " + std::to_string(expected));
@@ -144,16 +153,18 @@ int main() {
         }
         Fill();
         for (const bool wave32 : {false, true}) {
-            Check(0u, false, wave32, false, 16u, "the first record's callee with SCC 0");
-            Check(0u, true, wave32, false, 17u, "the first record's callee with SCC 1");
-            Check(1u, false, wave32, false, 32u, "the second record's callee with SCC 0");
-            Check(1u, true, wave32, false, 33u, "the second record's callee with SCC 1");
-            Check(0u, false, wave32, true, 16u, "the first record's callee through a constant descriptor address with SCC 0");
-            Check(0u, true, wave32, true, 17u, "the first record's callee through a constant descriptor address with SCC 1");
-            Check(1u, false, wave32, true, 32u, "the second record's callee through a constant descriptor address with SCC 0");
-            Check(1u, true, wave32, true, 33u, "the second record's callee through a constant descriptor address with SCC 1");
-            Check(2u, false, wave32, true, 0u, "a record past the table skipped by the caller's null check");
-            const auto log = Dispatch(2u, false, wave32, false);
+            Check(0u, false, wave32, Caller.data(), 16u, "the first record's callee with SCC 0");
+            Check(0u, true, wave32, Caller.data(), 17u, "the first record's callee with SCC 1");
+            Check(1u, false, wave32, Caller.data(), 32u, "the second record's callee with SCC 0");
+            Check(1u, true, wave32, Caller.data(), 33u, "the second record's callee with SCC 1");
+            Check(0u, false, wave32, ConstantCaller.data(), 16u, "the first record's callee through a constant descriptor address with SCC 0");
+            Check(0u, true, wave32, ConstantCaller.data(), 17u, "the first record's callee through a constant descriptor address with SCC 1");
+            Check(1u, false, wave32, ConstantCaller.data(), 32u, "the second record's callee through a constant descriptor address with SCC 0");
+            Check(1u, true, wave32, ConstantCaller.data(), 33u, "the second record's callee through a constant descriptor address with SCC 1");
+            Check(2u, false, wave32, ConstantCaller.data(), 0u, "a record past the table skipped by the caller's null check");
+            Check(0u, false, wave32, SystemCaller.data(), 0u, "the system GPU page's first hook");
+            Check(1u, true, wave32, SystemCaller.data(), 0u, "the system GPU page's second hook");
+            const auto log = Dispatch(2u, false, wave32, Caller.data());
             Require(log.find("called address 0x0 at program counter") != std::string::npos && log.find("which no linked callee of that call matches") != std::string::npos,
                 std::string("a record past the table did not report an unlinked call") + (wave32 ? " (wave32)" : " (wave64)") + ": " + log);
             for (std::uint32_t lane = 0; lane < Threads; ++lane) {
