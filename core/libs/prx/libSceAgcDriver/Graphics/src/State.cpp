@@ -741,7 +741,12 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         validate(amplification != 0, "fast launch subgroup amplifies to no primitives");
         const auto maxPrimitives = primitives * amplification;
         const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, maxPrimitives});
-        result.mesh = ShaderRecompiler::MeshConfiguration{primitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, maxPrimitives, ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, 0, esgsItemSize};
+        // Debug aid: APS5_FAST_LAUNCH_SINGLE_WAVE=1 runs a fast-launch subgroup as one wave of the
+        // guest wave size, as the console does (the wave emits its amplified primitives itself),
+        // instead of as many waves as the amplified vertex and primitive counts need.
+        static const bool fastLaunchSingleWave = std::getenv("APS5_FAST_LAUNCH_SINGLE_WAVE") != nullptr;
+        const auto groupThreads = fastLaunch && fastLaunchSingleWave ? result.vertexWaveSize : ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize;
+        result.mesh = ShaderRecompiler::MeshConfiguration{primitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, maxPrimitives, groupThreads, ((resources >> 19u) & 0xffu) * 128u, 0, esgsItemSize};
     }
     return result;
 }

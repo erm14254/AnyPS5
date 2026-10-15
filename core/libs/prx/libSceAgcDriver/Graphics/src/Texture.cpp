@@ -3437,41 +3437,116 @@ struct StorageDumpSelector {
     bool anyFormat = true;
 };
 
-const StorageDumpSelector& StorageDumpSelection() {
-    static const StorageDumpSelector selector = [] {
-        StorageDumpSelector parsed;
+// APS5_DUMP_STORAGE=<entry>[,<entry>...]: an entry is a hex base address or WxHxL[:format], where
+// L = 0 matches any layer count.
+const std::vector<StorageDumpSelector>& StorageDumpSelection() {
+    static const std::vector<StorageDumpSelector> selectors = [] {
+        std::vector<StorageDumpSelector> parsed;
         const char* text = std::getenv("APS5_DUMP_STORAGE");
         if (text == nullptr) return parsed;
-        if (const int fields = std::sscanf(text, "%ux%ux%u:%u", &parsed.width, &parsed.height, &parsed.layers, &parsed.format); fields >= 3) {
-            parsed.anyFormat = fields < 4;
-            return parsed;
+        const std::string list(text);
+        std::size_t start = 0;
+        while (start <= list.size()) {
+            const auto comma = list.find(',', start);
+            const auto entry = list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+            if (!entry.empty()) {
+                StorageDumpSelector one;
+                if (const int fields = std::sscanf(entry.c_str(), "%ux%ux%u:%u", &one.width, &one.height, &one.layers, &one.format); fields >= 3) one.anyFormat = fields < 4;
+                else one.address = std::strtoull(entry.c_str(), nullptr, 16);
+                parsed.push_back(one);
+            }
+            if (comma == std::string::npos) break;
+            start = comma + 1;
         }
-        parsed.address = std::strtoull(text, nullptr, 16);
         return parsed;
     }();
-    return selector;
+    return selectors;
+}
+
+bool StorageDumpEnabled() {
+    return !StorageDumpSelection().empty();
 }
 
 bool StorageDumpSelects(const GuestTextureResource& descriptor) {
-    const auto& selector = StorageDumpSelection();
-    if (selector.address != 0) return descriptor.baseAddress == selector.address;
-    return selector.width != 0 && descriptor.width == selector.width && descriptor.height == selector.height && descriptor.depthOrLastArray + 1 == selector.layers && (selector.anyFormat || descriptor.format == selector.format);
+    for (const auto& selector : StorageDumpSelection()) {
+        if (selector.address != 0) {
+            if (descriptor.baseAddress == selector.address) return true;
+            continue;
+        }
+        if (selector.width != 0 && descriptor.width == selector.width && descriptor.height == selector.height && (selector.layers == 0 || descriptor.depthOrLastArray + 1 == selector.layers) && (selector.anyFormat || descriptor.format == selector.format)) return true;
+    }
+    return false;
 }
 
 }
 
 void StorageTexture::FlushDumpSelected(const char* reason) {
-    const auto& selector = StorageDumpSelection();
-    if (selector.address == 0 && selector.width == 0) return;
-    std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+    if (!StorageDumpEnabled()) return;
+    // Debug aid: every storage image APS5_DUMP_STORAGE selects is read back from its live device
+    // image at each flip, from the APS5_DUMP_STORAGE_AFTER-th flip on (default 0), up to
+    // APS5_DUMP_STORAGE_MAX images (default 8), as storage_<address>_<n>.raw (u32 width in elements,
+    // height, VkFormat, then the linear rows of mip 0, layers concatenated).
+    static const int after = [] { const char* text = std::getenv("APS5_DUMP_STORAGE_AFTER"); return text != nullptr ? std::atoi(text) : 0; }();
+    static const int limit = [] { const char* text = std::getenv("APS5_DUMP_STORAGE_MAX"); return text != nullptr ? std::atoi(text) : 8; }();
+    static int flips = 0;
+    static int written = 0;
+    if (flips++ < after) return;
+    std::vector<std::shared_ptr<StorageTexture>> selected;
     {
-        auto& pending = Pending();
-        std::lock_guard lock(pending.mutex);
-        for (const auto* texture : pending.textures) {
-            if (StorageDumpSelects(texture->descriptor)) ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (!StorageDumpSelects(texture->descriptor)) continue;
+            if (auto alive = texture->weak_from_this().lock()) selected.push_back(std::move(alive));
         }
     }
-    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
+    for (const auto& texture : selected) {
+        if (written >= limit) return;
+        texture->dumpLiveImage(written++, reason, flips - 1);
+    }
+}
+
+void StorageTexture::dumpLiveImage(int index, const char* reason, int flip) {
+    if (image == VK_NULL_HANDLE || mips.empty()) return;
+    if (auto* recorder = Recorder::Active()) recorder->SyncThrough(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    const auto bytes = static_cast<std::size_t>(geometry.LinearLayerOffset(arrayLayers));
+    Buffer host(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch batch(context);
+    const auto commands = batch.Handle();
+    VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSource.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.image = image;
+    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+    const auto regions = CopyRegions();
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, host.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    VkImageMemoryBarrier backToGeneral = toSource;
+    backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &backToGeneral);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    char name[64];
+    std::snprintf(name, sizeof(name), "storage_%llx_%d.raw", static_cast<unsigned long long>(descriptor.baseAddress), index);
+    std::FILE* file = std::fopen(name, "wb");
+    if (file == nullptr) return;
+    const std::uint32_t header[3] = {mips[0].pitchBytes / static_cast<std::uint32_t>(elementBytes), mips[0].height, static_cast<std::uint32_t>(storageFormat)};
+    std::fwrite(header, sizeof(header), 1, file);
+    const auto data = host.Bytes();
+    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+        if (!geometry.HasLayer(0, layer)) continue;
+        std::fwrite(data.data() + geometry.LinearLayerOffset(layer) + mips[0].linearOffset, 1, static_cast<std::size_t>(mips[0].linearSize), file);
+    }
+    std::fclose(file);
+    std::fprintf(stderr, "[storage-dump] %s: 0x%llx %ux%u lastArray=%u format=%u vk=%d mips=%u at flip %d (%s)" "%c", name, static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.depthOrLastArray, descriptor.format, static_cast<int>(storageFormat), descriptor.mipCount, flip, reason, 10);
 }
 
 void StorageTexture::FlushAllPending(const char* reason) {
