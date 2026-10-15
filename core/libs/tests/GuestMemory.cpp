@@ -48,6 +48,7 @@ int APS5_VABI mprotect_nid_postfix(void*, std::size_t, int) noexcept;
 int APS5_VABI madvise_nid_postfix(void*, std::size_t, int);
 int APS5_VABI mincore_nid_postfix(const void*, std::size_t, char*);
 int* APS5_VABI __error_nid_postfix();
+std::uint64_t SystemGpuPage_nid_no_patch();
 int APS5_VABI sceKernelMapNamedFlexibleMemory(void**, std::size_t, int, int, const char*);
 int APS5_VABI sceKernelMapNamedFlexibleMemoryInternal(void**, std::size_t, int, int, const char*);
 int APS5_VABI sceKernelAvailableFlexibleMemorySize(std::size_t*);
@@ -116,6 +117,22 @@ static void CheckReleaseFlexibleMemory() {
     Require(sceKernelMapFlexibleMemory(&again, length, 3, 0x90) == 0 && again == mapped);
     Require(static_cast<volatile unsigned char*>(again)[length - 1] == 0);
     Require(sceKernelMunmap(again, length) == 0);
+}
+
+static void CheckSystemGpuPage() {
+    constexpr std::uintptr_t page = 0xfe0040000ull;
+    constexpr std::size_t bytes = 0x4000;
+    const auto failed = reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1));
+    Require(SystemGpuPage_nid_no_patch() == page);
+    VirtualQueryInfo info{};
+    Require(sceKernelVirtualQuery(reinterpret_cast<const void*>(page), 0, &info, sizeof(info)) == 0);
+    Require(info.start == page && info.end == page + bytes && info.is_committed);
+    const auto* words = reinterpret_cast<const std::uint32_t*>(page);
+    Require(words[0] == 0xe0040100u && words[1] == 0xfu && words[2] == 0x3f00u && words[3] == 0x31016facu);
+    Require(std::all_of(words + 4, words + bytes / 4, [](std::uint32_t value) { return value == 0; }));
+    *__error_nid_postfix() = 0;
+    Require(mmap_nid_postfix(reinterpret_cast<void*>(page + bytes), bytes, 3, 0x1012, -1, 0) == failed);
+    Require(SystemGpuPage_nid_no_patch() == page);
 }
 
 static void CheckFlexibleMappingIgnoresFlag8000() {
@@ -2551,6 +2568,7 @@ int main(int argc, char** argv) {
     CheckVirtualQuerySplitFlexibleRanges();
     CheckVirtualQueryForNonReadableGuestRange();
     CheckReleaseFlexibleMemory();
+    CheckSystemGpuPage();
     CheckFlexibleMappingIgnoresFlag8000();
     CheckSceKernelMmap();
     CheckInternalMemoryAvailableSize();

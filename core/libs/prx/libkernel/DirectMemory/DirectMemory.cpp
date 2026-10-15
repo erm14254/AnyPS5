@@ -4,6 +4,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <iterator>
 #include <map>
@@ -143,7 +144,41 @@ static int mprotect(void* addr, size_t len, int prot) {
 namespace {
 
 constexpr int GuestMapFixedFlag = 0x10;
+constexpr int GuestMapNoOverwriteFlag = 0x80;
 constexpr int GuestProtGpuReadWrite = 0x30;
+constexpr std::uintptr_t SystemGpuPageAddress = 0xfe0040000ull;
+constexpr std::uint32_t SystemGpuPageTableOffset = 0x100;
+constexpr int SystemGpuPageProtection = 0x13;
+std::atomic<int> systemGpuPageState{0};
+
+void EnsureSystemGpuPage() {
+    int untouched = 0;
+    if (!systemGpuPageState.compare_exchange_strong(untouched, 1)) return;
+    void* address = reinterpret_cast<void*>(SystemGpuPageAddress);
+    int result = SCE_KERNEL_ERROR_ENOMEM;
+    if (GuestArena::GuestArenaClaimSystem_nid_postfix(address, PS5_PAGE_SIZE)) {
+        try {
+            result = DoMapAnon(&address, PS5_PAGE_SIZE, SystemGpuPageProtection, GuestMapFixedFlag | GuestMapNoOverwriteFlag, PS5_PAGE_SIZE, true);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[memory] system GPU page: %s\n", error.what());
+        }
+    }
+    if (result != 0 || reinterpret_cast<std::uintptr_t>(address) != SystemGpuPageAddress) {
+        std::fprintf(stderr, "[memory] system GPU page at 0x%llx is unavailable; shaders that read it fault\n", static_cast<unsigned long long>(SystemGpuPageAddress));
+        systemGpuPageState.store(3);
+        return;
+    }
+    {
+        GuestArena::HostWrite write(address, PS5_PAGE_SIZE);
+        auto* words = static_cast<std::uint32_t*>(address);
+        const auto table = SystemGpuPageAddress + SystemGpuPageTableOffset;
+        words[0] = static_cast<std::uint32_t>(table);
+        words[1] = static_cast<std::uint32_t>(table >> 32u);
+        words[2] = static_cast<std::uint32_t>(PS5_PAGE_SIZE - SystemGpuPageTableOffset);
+        words[3] = 0x31016facu;
+    }
+    systemGpuPageState.store(2);
+}
 
 #if defined(__linux__)
 void* MapAtOrAbove(std::uintptr_t start, size_t len, int prot, size_t alignment) {
@@ -888,6 +923,7 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
 }
 
 int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+    EnsureSystemGpuPage();
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
@@ -923,6 +959,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
 }
 
 int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive) {
+    EnsureSystemGpuPage();
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     GuestAllocations::Mutation mutation;
@@ -1247,4 +1284,9 @@ void UnmapDirectMemoryViews(const std::vector<DirectMemoryView>& views) {
         Trace("unmap released view %p+0x%zx", reinterpret_cast<void*>(view.address), view.bytes);
         UnmapRegistered(mutation, reinterpret_cast<void*>(view.address), view.bytes);
     }
+}
+
+extern "C" std::uint64_t SystemGpuPage_nid_no_patch() {
+    EnsureSystemGpuPage();
+    return systemGpuPageState.load() == 2 ? SystemGpuPageAddress : 0u;
 }
